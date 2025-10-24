@@ -1,0 +1,197 @@
+#!/bin/sh
+# watchcat-plus — advanced connectivity watchdog with ping/HTTP/DNS tests
+
+. /lib/functions.sh
+. /lib/functions/network.sh
+
+CFG="config"
+ENABLED=1
+MODE="restart_interface"
+IFACE="pppoe-wan"
+TARGETS=""
+TEST_PING=1
+TEST_HTTP=0
+HTTP_URL=""
+TEST_DNS=0
+DNS_HOST=""
+FAIL_MAX=3
+OK_INTERVAL=60
+FAIL_INTERVAL=15
+JITTER=5
+SCRIPT=""
+LOG_TAG="watchcat-plus"
+BIND_TO_IFACE=1
+STATE_FILE="/var/run/watchcat-plus.state"
+
+log() {
+    logger -t "$LOG_TAG" "$*"
+}
+
+add_target() {
+    [ -n "$1" ] && TARGETS="$TARGETS $1"
+}
+
+# Load configuration from UCI
+load_cfg() {
+    config_load watchcat-plus
+    config_get_bool ENABLED  "$CFG" enabled 1
+    config_get      MODE     "$CFG" mode "$MODE"
+    config_get      IFACE    "$CFG" iface "$IFACE"
+    config_get_bool TEST_PING "$CFG" test_ping 1
+    config_get_bool TEST_HTTP "$CFG" test_http 0
+    config_get      HTTP_URL "$CFG" http_url ""
+    config_get_bool TEST_DNS "$CFG" test_dns 0
+    config_get      DNS_HOST "$CFG" dns_host ""
+    config_get      FAIL_MAX "$CFG" fail_max "$FAIL_MAX"
+    config_get      OK_INTERVAL   "$CFG" ok_interval "$OK_INTERVAL"
+    config_get      FAIL_INTERVAL "$CFG" fail_interval "$FAIL_INTERVAL"
+    config_get      JITTER   "$CFG" jitter "$JITTER"
+    config_get      SCRIPT   "$CFG" script ""
+    config_get      LOG_TAG  "$CFG" log_tag "$LOG_TAG"
+    config_get_bool BIND_TO_IFACE "$CFG" bind_to_iface 1
+    # Collect targets
+    TARGETS=""
+    config_list_foreach "$CFG" targets add_target
+    [ -z "$TARGETS" ] && TARGETS="1.1.1.1 8.8.8.8"
+}
+
+# Get device associated with interface
+get_dev() {
+    network_flush_cache
+    network_get_device DEV "$IFACE"
+    # fallback: if network_get_device fails, use interface name itself
+    [ -z "$DEV" ] && DEV="$IFACE"
+    echo "$DEV"
+}
+
+# Sleep with jitter
+sleep_jitter() {
+    local base="$1"
+    local add=0
+    [ "$JITTER" -gt 0 ] 2>/dev/null && add=$(awk -v j="$JITTER" 'BEGIN{srand(); print int(rand()*(j+1))}')
+    sleep $((base + add))
+}
+
+# Ping test across targets
+check_ping() {
+    local dev ip src
+    if [ "$BIND_TO_IFACE" = "1" ]; then
+        dev="$(get_dev)"
+        src="$(ip -o -4 addr show dev "$dev" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)"
+    fi
+    for ip in $TARGETS; do
+        # Source IP test
+        [ -n "$src" ] && ping -I "$src" -c1 -W2 "$ip" >/dev/null 2>&1 && return 0
+        # Interface test
+        [ -n "$dev" ] && ping -I "$dev" -c1 -W2 "$ip" >/dev/null 2>&1 && return 0
+        # Generic ping
+        ping -c1 -W2 "$ip" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+# HTTP connectivity check using wget
+check_http() {
+    [ -z "$HTTP_URL" ] && return 1
+    wget -q -T 3 -O /dev/null "$HTTP_URL" >/dev/null 2>&1
+    return $?
+}
+
+# DNS resolution check
+check_dns() {
+    [ -z "$DNS_HOST" ] && return 1
+    nslookup "$DNS_HOST" 127.0.0.1 >/dev/null 2>&1 && return 0
+    return 1
+}
+
+# Perform connectivity checks based on enabled tests
+smart_check() {
+    [ "$TEST_PING" -eq 1 ] && check_ping && return 0
+    [ "$TEST_HTTP" -eq 1 ] && check_http && return 0
+    [ "$TEST_DNS" -eq 1 ] && check_dns && return 0
+    return 1
+}
+
+# Write state file for status API
+write_state() {
+    cat > "$STATE_FILE" <<EOF
+{"iface":"$IFACE","targets":"$TARGETS","fail_count":$1,"state":"$2","ts":"$(date +%s)","msg":"$3"}
+EOF
+}
+
+# Perform the configured action when threshold is hit
+perform_action() {
+    case "$MODE" in
+        restart_device)
+            log "Internet yok, cihaz yeniden başlatılıyor"
+            reboot
+            ;;
+        restart_interface)
+            log "Internet yok, $IFACE arayüzü yeniden başlatılıyor"
+            ifdown "$IFACE" >/dev/null 2>&1
+            sleep 3
+            ifup "$IFACE" >/dev/null 2>&1
+            ;;
+        run_script)
+            if [ -x "$SCRIPT" ]; then
+                log "Internet yok, özel betik çalıştırılıyor: $SCRIPT"
+                "$SCRIPT" "$IFACE"
+            else
+                log "Internet yok, betik bulunamadı veya çalıştırılabilir değil: $SCRIPT"
+            fi
+            ;;
+        *)
+            log "Bilinmeyen eylem modu: $MODE"
+            ;;
+    esac
+}
+
+# Main daemon loop
+daemon() {
+    load_cfg
+    if [ "$ENABLED" != "1" ]; then
+        log "Devre dışı"
+        write_state 0 "disabled" "disabled"
+        exit 0
+    fi
+    local fail=0 prev_state="init"
+    touch "$STATE_FILE"
+    while true; do
+        if smart_check; then
+            # Reset fail count on success
+            if [ "$prev_state" != "ok" ] && [ "$fail" -gt 0 ]; then
+                log "Bağlantı düzeldi, ardışık hata=$fail"
+            fi
+            fail=0
+            prev_state="ok"
+            write_state $fail "ok" "ok"
+            sleep_jitter "$OK_INTERVAL"
+        else
+            fail=$((fail+1))
+            prev_state="fail"
+            write_state $fail "fail" "probe_fail"
+            if [ "$fail" -ge "$FAIL_MAX" ]; then
+                perform_action
+                fail=0
+                write_state $fail "recover" "restart"
+                sleep_jitter "$OK_INTERVAL"
+                prev_state="ok"
+            else
+                sleep_jitter "$FAIL_INTERVAL"
+            fi
+        fi
+    done
+}
+
+case "$1" in
+    status)
+        [ -f "$STATE_FILE" ] && cat "$STATE_FILE" || echo "{}"
+        ;;
+    daemon|"")
+        daemon
+        ;;
+    *)
+        echo "Usage: $0 [status|daemon]"
+        exit 1
+        ;;
+esac

@@ -1,0 +1,25 @@
+config watchcat_plus 'config'
+    option enabled '1'
+    # Mode can be: restart_interface, restart_device, run_script
+    option mode 'restart_interface'
+    option iface 'pppoe-wan'
+    # Multiple ping targets; connectivity is OK if ANY target responds
+    list targets '1.1.1.1'
+    list targets '8.8.8.8'
+    # Tests to perform: enable/disable individually
+    option test_ping '1'
+    option test_http '0'
+    option http_url 'https://connectivitycheck.gstatic.com/generate_204'
+    option test_dns '0'
+    option dns_host 'openwrt.org'
+    # Fail threshold and intervals (seconds)
+    option fail_max '3'
+    option ok_interval '60'
+    option fail_interval '15'
+    # Jitter adds up to N seconds of random delay to spread load
+    option jitter '5'
+    # If mode=run_script, script path to execute
+    option script '/usr/sbin/custom_fix.sh'
+    option log_tag 'watchcat-plus'
+    # Bind pings to interface to avoid wrong routing
+    option bind_to_iface '1'

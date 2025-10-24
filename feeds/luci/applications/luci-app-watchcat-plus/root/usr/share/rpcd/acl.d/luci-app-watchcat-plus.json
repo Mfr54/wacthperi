@@ -1,0 +1,7 @@
+{
+  "luci-app-watchcat-plus": {
+    "description": "Allow UCI access for watchcat-plus",
+    "read": { "uci": ["watchcat-plus"] },
+    "write": { "uci": ["watchcat-plus"] }
+  }
+}
